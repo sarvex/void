@@ -7,18 +7,18 @@
 /* eslint-disable */
 import Anthropic from '@anthropic-ai/sdk';
 import { Ollama } from 'ollama';
-import OpenAI, { ClientOptions } from 'openai';
+import OpenAI, { ClientOptions, AzureOpenAI } from 'openai';
 import { MistralCore } from '@mistralai/mistralai/core.js';
 import { fimComplete } from '@mistralai/mistralai/funcs/fimComplete.js';
-import { GoogleGenerativeAI, Tool as GeminiTool, SchemaType, FunctionDeclaration, FunctionDeclarationSchemaProperty } from '@google/generative-ai';
+import { Tool as GeminiTool, FunctionDeclaration, GoogleGenAI, ThinkingConfig, Schema, Type } from '@google/genai';
 import { GoogleAuth } from 'google-auth-library'
 /* eslint-enable */
 
-import { AnthropicLLMChatMessage, LLMChatMessage, LLMFIMMessage, ModelListParams, OllamaModelResponse, OnError, OnFinalMessage, OnText, RawToolCallObj, RawToolParamsObj } from '../../common/sendLLMMessageTypes.js';
+import { AnthropicLLMChatMessage, GeminiLLMChatMessage, LLMChatMessage, LLMFIMMessage, ModelListParams, OllamaModelResponse, OnError, OnFinalMessage, OnText, RawToolCallObj, RawToolParamsObj } from '../../common/sendLLMMessageTypes.js';
 import { ChatMode, displayInfoOfProviderName, ModelSelectionOptions, OverridesOfModel, ProviderName, SettingsOfProvider } from '../../common/voidSettingsTypes.js';
 import { getSendableReasoningInfo, getModelCapabilities, getProviderCapabilities, defaultProviderSettings, getReservedOutputTokenSpace } from '../../common/modelCapabilities.js';
 import { extractReasoningWrapper, extractXMLToolsWrapper } from './extractGrammar.js';
-import { availableTools, InternalToolInfo, isAToolName, ToolParamName, voidTools } from '../../common/prompt/prompts.js';
+import { availableTools, InternalToolInfo } from '../../common/prompt/prompts.js';
 import { generateUuid } from '../../../../../base/common/uuid.js';
 
 const getGoogleApiKey = async () => {
@@ -48,6 +48,7 @@ type SendChatParams_Internal = InternalCommonMessageParams & {
 	messages: LLMChatMessage[];
 	separateSystemMessage: string | undefined;
 	chatMode: ChatMode | null;
+	mcpTools: InternalToolInfo[] | undefined;
 }
 type SendFIMParams_Internal = InternalCommonMessageParams & { messages: LLMFIMMessage; separateSystemMessage: string | undefined; }
 export type ListParams_Internal<ModelResponse> = ModelListParams<ModelResponse>
@@ -114,10 +115,36 @@ const newOpenAICompatibleSDK = async ({ settingsOfProvider, providerName, includ
 	}
 	else if (providerName === 'microsoftAzure') {
 		// https://learn.microsoft.com/en-us/rest/api/aifoundry/model-inference/get-chat-completions/get-chat-completions?view=rest-aifoundry-model-inference-2024-05-01-preview&tabs=HTTP
+		//  https://github.com/openai/openai-node?tab=readme-ov-file#microsoft-azure-openai
 		const thisConfig = settingsOfProvider[providerName]
-		const baseURL = `https://${thisConfig.project}.services.ai.azure.com/api/models/chat/completions??api-version=${thisConfig.azureApiVersion}`
-		return new OpenAI({ baseURL: baseURL, apiKey: thisConfig.apiKey, ...commonPayloadOpts })
+		const endpoint = `https://${thisConfig.project}.openai.azure.com/`;
+		const apiVersion = thisConfig.azureApiVersion ?? '2024-04-01-preview';
+		const options = { endpoint, apiKey: thisConfig.apiKey, apiVersion };
+		return new AzureOpenAI({ ...options, ...commonPayloadOpts });
 	}
+	else if (providerName === 'awsBedrock') {
+		/**
+		  * We treat Bedrock as *OpenAI-compatible only through a proxy*:
+		  *   • LiteLLM default → http://localhost:4000/v1
+		  *   • Bedrock-Access-Gateway → https://<api-id>.execute-api.<region>.amazonaws.com/openai/
+		  *
+		  * The native Bedrock runtime endpoint
+		  *   https://bedrock-runtime.<region>.amazonaws.com
+		  * is **NOT** OpenAI-compatible, so we do *not* fall back to it here.
+		  */
+		const { endpoint, apiKey } = settingsOfProvider.awsBedrock
+
+		// ① use the user-supplied proxy if present
+		// ② otherwise default to local LiteLLM
+		let baseURL = endpoint || 'http://localhost:4000/v1'
+
+		// Normalize: make sure we end with “/v1”
+		if (!baseURL.endsWith('/v1'))
+			baseURL = baseURL.replace(/\/+$/, '') + '/v1'
+
+		return new OpenAI({ baseURL, apiKey, ...commonPayloadOpts })
+	}
+
 
 	else if (providerName === 'deepseek') {
 		const thisConfig = settingsOfProvider[providerName]
@@ -147,7 +174,12 @@ const newOpenAICompatibleSDK = async ({ settingsOfProvider, providerName, includ
 
 const _sendOpenAICompatibleFIM = async ({ messages: { prefix, suffix, stopTokens }, onFinalMessage, onError, settingsOfProvider, modelName: modelName_, _setAborter, providerName, overridesOfModel }: SendFIMParams_Internal) => {
 
-	const { modelName, supportsFIM } = getModelCapabilities(providerName, modelName_, overridesOfModel)
+	const {
+		modelName,
+		supportsFIM,
+		additionalOpenAIPayload,
+	} = getModelCapabilities(providerName, modelName_, overridesOfModel)
+
 	if (!supportsFIM) {
 		if (modelName === modelName_)
 			onError({ message: `Model ${modelName} does not support FIM.`, fullError: null })
@@ -156,7 +188,7 @@ const _sendOpenAICompatibleFIM = async ({ messages: { prefix, suffix, stopTokens
 		return
 	}
 
-	const openai = await newOpenAICompatibleSDK({ providerName, settingsOfProvider })
+	const openai = await newOpenAICompatibleSDK({ providerName, settingsOfProvider, includeInPayload: additionalOpenAIPayload })
 	openai.completions
 		.create({
 			model: modelName,
@@ -198,8 +230,8 @@ const toOpenAICompatibleTool = (toolInfo: InternalToolInfo) => {
 	} satisfies OpenAI.Chat.Completions.ChatCompletionTool
 }
 
-const openAITools = (chatMode: ChatMode) => {
-	const allowedTools = availableTools(chatMode)
+const openAITools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined) => {
+	const allowedTools = availableTools(chatMode, mcpTools)
 	if (!allowedTools || Object.keys(allowedTools).length === 0) return null
 
 	const openAITools: OpenAI.Chat.Completions.ChatCompletionTool[] = []
@@ -209,33 +241,41 @@ const openAITools = (chatMode: ChatMode) => {
 	return openAITools
 }
 
-const rawToolCallObjOf = (name: string, toolParamsStr: string, id: string): RawToolCallObj | null => {
-	if (!isAToolName(name)) return null
-	const rawParams: RawToolParamsObj = {}
+
+// convert LLM tool call to our tool format
+const rawToolCallObjOfParamsStr = (name: string, toolParamsStr: string, id: string): RawToolCallObj | null => {
 	let input: unknown
-	try {
-		input = JSON.parse(toolParamsStr)
-	}
-	catch (e) {
-		return null
-	}
+	try { input = JSON.parse(toolParamsStr) }
+	catch (e) { return null }
+
 	if (input === null) return null
 	if (typeof input !== 'object') return null
-	for (const paramName in voidTools[name].params) {
-		rawParams[paramName as ToolParamName] = (input as any)[paramName]
-	}
-	return { id, name, rawParams, doneParams: Object.keys(rawParams) as ToolParamName[], isDone: true }
+
+	const rawParams: RawToolParamsObj = input
+	return { id, name, rawParams, doneParams: Object.keys(rawParams), isDone: true }
+}
+
+
+const rawToolCallObjOfAnthropicParams = (toolBlock: Anthropic.Messages.ToolUseBlock): RawToolCallObj | null => {
+	const { id, name, input } = toolBlock
+
+	if (input === null) return null
+	if (typeof input !== 'object') return null
+
+	const rawParams: RawToolParamsObj = input
+	return { id, name, rawParams, doneParams: Object.keys(rawParams), isDone: true }
 }
 
 
 // ------------ OPENAI-COMPATIBLE ------------
 
 
-const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onError, settingsOfProvider, modelSelectionOptions, modelName: modelName_, _setAborter, providerName, chatMode, separateSystemMessage, overridesOfModel }: SendChatParams_Internal) => {
+const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onError, settingsOfProvider, modelSelectionOptions, modelName: modelName_, _setAborter, providerName, chatMode, separateSystemMessage, overridesOfModel, mcpTools }: SendChatParams_Internal) => {
 	const {
 		modelName,
 		specialToolFormat,
 		reasoningCapabilities,
+		additionalOpenAIPayload,
 	} = getModelCapabilities(providerName, modelName_, overridesOfModel)
 
 	const { providerReasoningIOSettings } = getProviderCapabilities(providerName)
@@ -243,23 +283,30 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 	// reasoning
 	const { canIOReasoning, openSourceThinkTags } = reasoningCapabilities || {}
 	const reasoningInfo = getSendableReasoningInfo('Chat', providerName, modelName_, modelSelectionOptions, overridesOfModel) // user's modelName_ here
-	const includeInPayload = providerReasoningIOSettings?.input?.includeInPayload?.(reasoningInfo) || {}
 
-	console.log('include', includeInPayload)
-	console.log('reasoningInfo', reasoningInfo)
+	const includeInPayload = {
+		...providerReasoningIOSettings?.input?.includeInPayload?.(reasoningInfo),
+		...additionalOpenAIPayload
+	}
+
 	// tools
-	const potentialTools = chatMode !== null ? openAITools(chatMode) : null
+	const potentialTools = openAITools(chatMode, mcpTools)
 	const nativeToolsObj = potentialTools && specialToolFormat === 'openai-style' ?
 		{ tools: potentialTools } as const
 		: {}
 
 	// instance
 	const openai: OpenAI = await newOpenAICompatibleSDK({ providerName, settingsOfProvider, includeInPayload })
+	if (providerName === 'microsoftAzure') {
+		// Required to select the model
+		(openai as AzureOpenAI).deploymentName = modelName;
+	}
 	const options: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming = {
 		model: modelName,
 		messages: messages as any,
 		stream: true,
 		...nativeToolsObj,
+		...additionalOpenAIPayload
 		// max_completion_tokens: maxTokens,
 	}
 
@@ -274,7 +321,7 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 
 	// manually parse out tool results if XML
 	if (!specialToolFormat) {
-		const { newOnText, newOnFinalMessage } = extractXMLToolsWrapper(onText, onFinalMessage, chatMode)
+		const { newOnText, newOnFinalMessage } = extractXMLToolsWrapper(onText, onFinalMessage, chatMode, mcpTools)
 		onText = newOnText
 		onFinalMessage = newOnFinalMessage
 	}
@@ -319,7 +366,7 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 				onText({
 					fullText: fullTextSoFar,
 					fullReasoning: fullReasoningSoFar,
-					toolCall: isAToolName(toolName) ? { name: toolName, rawParams: {}, isDone: false, doneParams: [], id: toolId } : undefined,
+					toolCall: !toolName ? undefined : { name: toolName, rawParams: {}, isDone: false, doneParams: [], id: toolId },
 				})
 
 			}
@@ -328,7 +375,7 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 				onError({ message: 'Void: Response from model was empty.', fullError: null })
 			}
 			else {
-				const toolCall = rawToolCallObjOf(toolName, toolParamsStr, toolId)
+				const toolCall = rawToolCallObjOfParamsStr(toolName, toolParamsStr, toolId)
 				const toolCallObj = toolCall ? { toolCall } : {}
 				onFinalMessage({ fullText: fullTextSoFar, fullReasoning: fullReasoningSoFar, anthropicReasoning: null, ...toolCallObj });
 			}
@@ -394,8 +441,8 @@ const toAnthropicTool = (toolInfo: InternalToolInfo) => {
 	} satisfies Anthropic.Messages.Tool
 }
 
-const anthropicTools = (chatMode: ChatMode) => {
-	const allowedTools = availableTools(chatMode)
+const anthropicTools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined) => {
+	const allowedTools = availableTools(chatMode, mcpTools)
 	if (!allowedTools || Object.keys(allowedTools).length === 0) return null
 
 	const anthropicTools: Anthropic.Messages.ToolUnion[] = []
@@ -405,20 +452,10 @@ const anthropicTools = (chatMode: ChatMode) => {
 	return anthropicTools
 }
 
-const anthropicToolToRawToolCallObj = (toolBlock: Anthropic.Messages.ToolUseBlock): RawToolCallObj | null => {
-	const { id, name, input } = toolBlock
-	if (!isAToolName(name)) return null
-	const rawParams: RawToolParamsObj = {}
-	if (input === null) return null
-	if (typeof input !== 'object') return null
-	for (const paramName in voidTools[name].params) {
-		rawParams[paramName as ToolParamName] = (input as any)[paramName]
-	}
-	return { id, name, rawParams, doneParams: Object.keys(rawParams) as ToolParamName[], isDone: true }
-}
+
 
 // ------------ ANTHROPIC ------------
-const sendAnthropicChat = async ({ messages, providerName, onText, onFinalMessage, onError, settingsOfProvider, modelSelectionOptions, overridesOfModel, modelName: modelName_, _setAborter, separateSystemMessage, chatMode }: SendChatParams_Internal) => {
+const sendAnthropicChat = async ({ messages, providerName, onText, onFinalMessage, onError, settingsOfProvider, modelSelectionOptions, overridesOfModel, modelName: modelName_, _setAborter, separateSystemMessage, chatMode, mcpTools }: SendChatParams_Internal) => {
 	const {
 		modelName,
 		specialToolFormat,
@@ -435,7 +472,7 @@ const sendAnthropicChat = async ({ messages, providerName, onText, onFinalMessag
 	const maxTokens = getReservedOutputTokenSpace(providerName, modelName_, { isReasoningEnabled: !!reasoningInfo?.isReasoningEnabled, overridesOfModel })
 
 	// tools
-	const potentialTools = chatMode !== null ? anthropicTools(chatMode) : null
+	const potentialTools = anthropicTools(chatMode, mcpTools)
 	const nativeToolsObj = potentialTools && specialToolFormat === 'anthropic-style' ?
 		{ tools: potentialTools, tool_choice: { type: 'auto' } } as const
 		: {}
@@ -459,7 +496,7 @@ const sendAnthropicChat = async ({ messages, providerName, onText, onFinalMessag
 
 	// manually parse out tool results if XML
 	if (!specialToolFormat) {
-		const { newOnText, newOnFinalMessage } = extractXMLToolsWrapper(onText, onFinalMessage, chatMode)
+		const { newOnText, newOnFinalMessage } = extractXMLToolsWrapper(onText, onFinalMessage, chatMode, mcpTools)
 		onText = newOnText
 		onFinalMessage = newOnFinalMessage
 	}
@@ -476,7 +513,7 @@ const sendAnthropicChat = async ({ messages, providerName, onText, onFinalMessag
 		onText({
 			fullText,
 			fullReasoning,
-			toolCall: isAToolName(fullToolName) ? { name: fullToolName, rawParams: {}, isDone: false, doneParams: [], id: 'dummy' } : undefined,
+			toolCall: !fullToolName ? undefined : { name: fullToolName, rawParams: {}, isDone: false, doneParams: [], id: 'dummy' },
 		})
 	}
 	// there are no events for tool_use, it comes in at the end
@@ -526,8 +563,11 @@ const sendAnthropicChat = async ({ messages, providerName, onText, onFinalMessag
 	stream.on('finalMessage', (response) => {
 		const anthropicReasoning = response.content.filter(c => c.type === 'thinking' || c.type === 'redacted_thinking')
 		const tools = response.content.filter(c => c.type === 'tool_use')
-		const toolCall = tools[0] && anthropicToolToRawToolCallObj(tools[0])
+		// console.log('TOOLS!!!!!!', JSON.stringify(tools, null, 2))
+		// console.log('TOOLS!!!!!!', JSON.stringify(response, null, 2))
+		const toolCall = tools[0] && rawToolCallObjOfAnthropicParams(tools[0])
 		const toolCallObj = toolCall ? { toolCall } : {}
+
 		onFinalMessage({ fullText, fullReasoning, anthropicReasoning, ...toolCallObj })
 	})
 	// on error
@@ -642,27 +682,26 @@ const sendOllamaFIM = ({ messages, onFinalMessage, onError, settingsOfProvider, 
 
 // ---------------- GEMINI NATIVE IMPLEMENTATION ----------------
 
-
-
 const toGeminiFunctionDecl = (toolInfo: InternalToolInfo) => {
 	const { name, description, params } = toolInfo
-	const paramsWithType: { [k: string]: FunctionDeclarationSchemaProperty } = {}
-	for (const key in params) {
-		paramsWithType[key] = { type: SchemaType.STRING, ...params[key] }
-	}
 	return {
 		name,
 		description,
 		parameters: {
-			type: SchemaType.OBJECT,
-			properties: paramsWithType,
+			type: Type.OBJECT,
+			properties: Object.entries(params).reduce((acc, [key, value]) => {
+				acc[key] = {
+					type: Type.STRING,
+					description: value.description
+				};
+				return acc;
+			}, {} as Record<string, Schema>)
 		}
 	} satisfies FunctionDeclaration
 }
 
-
-const geminiTools = (chatMode: ChatMode): GeminiTool[] | null => {
-	const allowedTools = availableTools(chatMode)
+const geminiTools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined): GeminiTool[] | null => {
+	const allowedTools = availableTools(chatMode, mcpTools)
 	if (!allowedTools || Object.keys(allowedTools).length === 0) return null
 	const functionDecls: FunctionDeclaration[] = []
 	for (const t in allowedTools ?? {}) {
@@ -688,6 +727,7 @@ const sendGeminiChat = async ({
 	providerName,
 	modelSelectionOptions,
 	chatMode,
+	mcpTools,
 }: SendChatParams_Internal) => {
 
 	if (providerName !== 'gemini') throw new Error(`Sending Gemini chat, but provider was ${providerName}`)
@@ -700,31 +740,31 @@ const sendGeminiChat = async ({
 		// reasoningCapabilities,
 	} = getModelCapabilities(providerName, modelName_, overridesOfModel)
 
-	const { providerReasoningIOSettings } = getProviderCapabilities(providerName)
+	// const { providerReasoningIOSettings } = getProviderCapabilities(providerName)
 
 	// reasoning
 	// const { canIOReasoning, openSourceThinkTags, } = reasoningCapabilities || {}
 	const reasoningInfo = getSendableReasoningInfo('Chat', providerName, modelName_, modelSelectionOptions, overridesOfModel) // user's modelName_ here
-	const includeInPayload = providerReasoningIOSettings?.input?.includeInPayload?.(reasoningInfo) || {}
+	// const includeInPayload = providerReasoningIOSettings?.input?.includeInPayload?.(reasoningInfo) || {}
+
+	const thinkingConfig: ThinkingConfig | undefined = !reasoningInfo?.isReasoningEnabled ? undefined
+		: reasoningInfo.type === 'budget_slider_value' ?
+			{ thinkingBudget: reasoningInfo.reasoningBudget }
+			: undefined
 
 	// tools
-	const potentialTools = chatMode !== null ? geminiTools(chatMode) : null
-	const nativeToolsObj = potentialTools && specialToolFormat === 'gemini-style' ?
-		{ tools: potentialTools } as const
-		: {}
+	const potentialTools = geminiTools(chatMode, mcpTools)
+	const toolConfig = potentialTools && specialToolFormat === 'gemini-style' ?
+		potentialTools
+		: undefined
 
 	// instance
-	const genAI = new GoogleGenerativeAI(
-		thisConfig.apiKey
-	);
-	const model = genAI.getGenerativeModel({
-		systemInstruction: separateSystemMessage,
-		model: modelName,
-	});
+	const genAI = new GoogleGenAI({ apiKey: thisConfig.apiKey });
+
 
 	// manually parse out tool results if XML
 	if (!specialToolFormat) {
-		const { newOnText, newOnFinalMessage } = extractXMLToolsWrapper(onText, onFinalMessage, chatMode)
+		const { newOnText, newOnFinalMessage } = extractXMLToolsWrapper(onText, onFinalMessage, chatMode, mcpTools)
 		onText = newOnText
 		onFinalMessage = newOnFinalMessage
 	}
@@ -735,28 +775,34 @@ const sendGeminiChat = async ({
 
 	let toolName = ''
 	let toolParamsStr = ''
+	let toolId = ''
 
-	model.generateContentStream({
-		systemInstruction: separateSystemMessage ?? undefined,
-		contents: messages as any,
-		...includeInPayload,
-		...nativeToolsObj,
+
+	genAI.models.generateContentStream({
+		model: modelName,
+		config: {
+			systemInstruction: separateSystemMessage,
+			thinkingConfig: thinkingConfig,
+			tools: toolConfig,
+		},
+		contents: messages as GeminiLLMChatMessage[],
 	})
-		.then(async ({ stream, response }) => {
+		.then(async (stream) => {
 			_setAborter(() => { stream.return(fullTextSoFar); });
 
 			// Process the stream
 			for await (const chunk of stream) {
 				// message
-				const newText = chunk.text() ?? ''
+				const newText = chunk.text ?? ''
 				fullTextSoFar += newText
 
 				// tool call
-				const functionCalls = chunk.functionCalls()
+				const functionCalls = chunk.functionCalls
 				if (functionCalls && functionCalls.length > 0) {
 					const functionCall = functionCalls[0] // Get the first function call
 					toolName = functionCall.name ?? ''
 					toolParamsStr = JSON.stringify(functionCall.args ?? {})
+					toolId = functionCall.id ?? ''
 				}
 
 				// (do not handle reasoning yet)
@@ -765,7 +811,7 @@ const sendGeminiChat = async ({
 				onText({
 					fullText: fullTextSoFar,
 					fullReasoning: fullReasoningSoFar,
-					toolCall: isAToolName(toolName) ? { name: toolName, rawParams: {}, isDone: false, doneParams: [], id: 'dummy' } : undefined,
+					toolCall: !toolName ? undefined : { name: toolName, rawParams: {}, isDone: false, doneParams: [], id: toolId },
 				})
 			}
 
@@ -773,8 +819,8 @@ const sendGeminiChat = async ({
 			if (!fullTextSoFar && !fullReasoningSoFar && !toolName) {
 				onError({ message: 'Void: Response from model was empty.', fullError: null })
 			} else {
-				const toolId = generateUuid() // gemini does not generate tool IDs. Generate one
-				const toolCall = rawToolCallObjOf(toolName, toolParamsStr, toolId)
+				if (!toolId) toolId = generateUuid() // ids are empty, but other providers might expect an id
+				const toolCall = rawToolCallObjOfParamsStr(toolName, toolParamsStr, toolId)
 				const toolCallObj = toolCall ? { toolCall } : {}
 				onFinalMessage({ fullText: fullTextSoFar, fullReasoning: fullReasoningSoFar, anthropicReasoning: null, ...toolCallObj });
 			}
@@ -886,6 +932,12 @@ export const sendLLMMessageToProviderImplementation = {
 		sendFIM: null,
 		list: null,
 	},
+	awsBedrock: {
+		sendChat: (params) => _sendOpenAICompatibleChat(params),
+		sendFIM: null,
+		list: null,
+	},
+
 } satisfies CallFnOfProvider
 
 

@@ -7,7 +7,7 @@ import { IWorkspaceContextService } from '../../../../platform/workspace/common/
 import { IEditorService } from '../../../services/editor/common/editorService.js';
 import { ChatMessage } from '../common/chatThreadServiceTypes.js';
 import { getIsReasoningEnabledState, getReservedOutputTokenSpace, getModelCapabilities } from '../common/modelCapabilities.js';
-import { reParsedToolXMLString, chat_systemMessage, ToolName } from '../common/prompt/prompts.js';
+import { reParsedToolXMLString, chat_systemMessage } from '../common/prompt/prompts.js';
 import { AnthropicLLMChatMessage, AnthropicReasoning, GeminiLLMChatMessage, LLMChatMessage, LLMFIMMessage, OpenAILLMChatMessage, RawToolParamsObj } from '../common/sendLLMMessageTypes.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
 import { ChatMode, FeatureName, ModelSelection, ProviderName } from '../common/voidSettingsTypes.js';
@@ -16,7 +16,10 @@ import { ITerminalToolService } from './terminalToolService.js';
 import { IVoidModelService } from '../common/voidModelService.js';
 import { URI } from '../../../../base/common/uri.js';
 import { EndOfLinePreference } from '../../../../editor/common/model.js';
+import { ToolName } from '../common/toolsServiceTypes.js';
+import { IMCPService } from '../common/mcpService.js';
 
+export const EMPTY_MESSAGE = '(empty message)'
 
 
 
@@ -36,7 +39,6 @@ type SimpleLLMMessage = {
 }
 
 
-const EMPTY_MESSAGE = '(empty message)'
 
 const CHARS_PER_TOKEN = 4 // assume abysmal chars per token
 const TRIM_TO_LEN = 120
@@ -237,18 +239,6 @@ const prepareMessages_XML_tools = (messages: SimpleLLMMessage[], supportsAnthrop
 }
 
 
-
-
-export type GeminiMessage = {
-	role: 'user' | 'model'; // Gemini uses 'user' and 'model' roles
-	parts: (
-		| { text: string; }
-		| { functionCall: { tool_call: any } }
-		| { functionResponse: { name: ToolName, response: { result: string } } }
-	)[];
-};
-
-
 // --- CHAT ---
 
 const prepareOpenAIOrAnthropicMessages = ({
@@ -417,14 +407,25 @@ const prepareOpenAIOrAnthropicMessages = ({
 
 
 	// ================ no empty message ================
-	for (const currMsg of llmMessages) {
+	for (let i = 0; i < llmMessages.length; i += 1) {
+		const currMsg: AnthropicOrOpenAILLMMessage = llmMessages[i]
+		const nextMsg: AnthropicOrOpenAILLMMessage | undefined = llmMessages[i + 1]
+
 		if (currMsg.role === 'tool') continue
 
 		// if content is a string, replace string with empty msg
-		if (typeof currMsg.content === 'string')
+		if (typeof currMsg.content === 'string') {
 			currMsg.content = currMsg.content || EMPTY_MESSAGE
+		}
 		else {
-			// if content is an array, replace any empty text entries with empty msg, and make sure there's at least 1 entry
+			// allowed to be empty if has a tool in it or following it
+			if (currMsg.content.find(c => c.type === 'tool_result' || c.type === 'tool_use')) {
+				currMsg.content = currMsg.content.filter(c => !(c.type === 'text' && !c.text)) as any
+				continue
+			}
+			if (nextMsg?.role === 'tool') continue
+
+			// replace any empty text entries with empty msg, and make sure there's at least 1 entry
 			for (const c of currMsg.content) {
 				if (c.type === 'text') c.text = c.text || EMPTY_MESSAGE
 			}
@@ -456,8 +457,8 @@ const prepareGeminiMessages = (messages: AnthropicLLMChatMessage[]) => {
 						return { text: c.text }
 					}
 					else if (c.type === 'tool_use') {
-						latestToolName = c.name as ToolName
-						return { functionCall: { name: c.name as ToolName, args: c.input } }
+						latestToolName = c.name
+						return { functionCall: { id: c.id, name: c.name, args: c.input } }
 					}
 					else return null
 				}).filter(m => !!m)
@@ -475,7 +476,7 @@ const prepareGeminiMessages = (messages: AnthropicLLMChatMessage[]) => {
 					}
 					else if (c.type === 'tool_result') {
 						if (!latestToolName) return null
-						return { functionResponse: { name: latestToolName, response: { result: c.content } } }
+						return { functionResponse: { id: c.tool_use_id, name: latestToolName, response: { output: c.content } } }
 					}
 					else return null
 				}).filter(m => !!m)
@@ -539,6 +540,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		@ITerminalToolService private readonly terminalToolService: ITerminalToolService,
 		@IVoidSettingsService private readonly voidSettingsService: IVoidSettingsService,
 		@IVoidModelService private readonly voidModelService: IVoidModelService,
+		@IMCPService private readonly mcpService: IMCPService,
 	) {
 		super()
 	}
@@ -588,8 +590,10 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 
 		const includeXMLToolDefinitions = !specialToolFormat
 
+		const mcpTools = this.mcpService.getMCPTools()
+
 		const persistentTerminalIDs = this.terminalToolService.listPersistentTerminalIds()
-		const systemMessage = chat_systemMessage({ workspaceFolders, openedURIs, directoryStr, activeURI, persistentTerminalIDs, chatMode, includeXMLToolDefinitions })
+		const systemMessage = chat_systemMessage({ workspaceFolders, openedURIs, directoryStr, activeURI, persistentTerminalIDs, chatMode, mcpTools, includeXMLToolDefinitions })
 		return systemMessage
 	}
 
@@ -674,13 +678,15 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 			contextWindow,
 			supportsSystemMessage,
 		} = getModelCapabilities(providerName, modelName, overridesOfModel)
-		const systemMessage = await this._generateChatMessagesSystemMessage(chatMode, specialToolFormat)
+
+		const { disableSystemMessage } = this.voidSettingsService.state.globalSettings;
+		const fullSystemMessage = await this._generateChatMessagesSystemMessage(chatMode, specialToolFormat)
+		const systemMessage = disableSystemMessage ? '' : fullSystemMessage;
 
 		const modelSelectionOptions = this.voidSettingsService.state.optionsOfModelSelection['Chat'][modelSelection.providerName]?.[modelSelection.modelName]
 
 		// Get combined AI instructions
 		const aiInstructions = this._getCombinedAIInstructions();
-
 		const isReasoningEnabled = getIsReasoningEnabledState('Chat', providerName, modelName, modelSelectionOptions, overridesOfModel)
 		const reservedOutputTokenSpace = getReservedOutputTokenSpace(providerName, modelName, { isReasoningEnabled, overridesOfModel })
 		const llmMessages = this._chatMessagesToSimpleMessages(chatMessages)

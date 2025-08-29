@@ -3,7 +3,8 @@
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
-import { ToolName, ToolParamName } from './prompt/prompts.js'
+import { InternalToolInfo } from './prompt/prompts.js'
+import { ToolName, ToolParamName } from './toolsServiceTypes.js'
 import { ChatMode, ModelSelection, ModelSelectionOptions, OverridesOfModel, ProviderName, RefreshableProviderName, SettingsOfProvider } from './voidSettingsTypes.js'
 
 
@@ -56,13 +57,13 @@ export type GeminiLLMChatMessage = {
 	role: 'model'
 	parts: (
 		| { text: string; }
-		| { functionCall: { name: ToolName, args: object } }
+		| { functionCall: { id: string; name: ToolName, args: Record<string, unknown> } }
 	)[];
 } | {
 	role: 'user';
 	parts: (
 		| { text: string; }
-		| { functionResponse: { name: ToolName, response: { result: string } } }
+		| { functionResponse: { id: string; name: ToolName, response: { output: string } } }
 	)[];
 }
 
@@ -78,12 +79,12 @@ export type LLMFIMMessage = {
 
 
 export type RawToolParamsObj = {
-	[paramName in ToolParamName]?: string;
+	[paramName in ToolParamName<ToolName>]?: string;
 }
 export type RawToolCallObj = {
 	name: ToolName;
 	rawParams: RawToolParamsObj;
-	doneParams: ToolParamName[];
+	doneParams: ToolParamName<ToolName>[];
 	id: string;
 	isDone: boolean;
 };
@@ -133,6 +134,7 @@ export type SendLLMMessageParams = {
 	overridesOfModel: OverridesOfModel | undefined;
 
 	settingsOfProvider: SettingsOfProvider;
+	mcpTools: InternalToolInfo[] | undefined;
 } & SendLLMType
 
 

@@ -32,6 +32,12 @@ export class VoidMainUpdateService extends Disposable implements IVoidUpdateServ
 			return { message: null } as const
 		}
 
+		// if disabled and not explicitly checking, return early
+		if (this._updateService.state.type === StateType.Disabled) {
+			if (!explicit)
+				return { message: null } as const
+		}
+
 		this._updateService.checkForUpdates(false) // implicity check, then handle result ourselves
 
 		console.log('updateState', this._updateService.state)
@@ -94,7 +100,7 @@ export class VoidMainUpdateService extends Disposable implements IVoidUpdateServ
 			const data = await response.json();
 			const version = data.tag_name;
 
-			const myVersion = `${this._productService.version}.${this._productService.release}`
+			const myVersion = this._productService.version
 			const latestVersion = version
 
 			const isUpToDate = myVersion === latestVersion // only makes sense if response.ok
